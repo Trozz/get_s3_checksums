@@ -6,7 +6,7 @@ This script creates a spreadsheet with the checksums of all the objects
 within a given S3 prefix.  Prints the name of the finished spreadsheet.
 
 Usage:
-    get_s3_checksums.py <S3_PREFIX> [--checksums=<CHECKSUMS>] [--concurrency=<CONCURRENCY>]
+    get_s3_checksums.py <S3_PREFIX> [--checksums=<CHECKSUMS>] [--concurrency=<CONCURRENCY>] [--force]
     get_s3_checksums.py (-h | --help)
 
 Options:
@@ -15,6 +15,7 @@ Options:
                                  [default: md5,sha1,sha256,sha512]
     --concurrency=<CONCURRENCY>  Max number of objects to fetch from S3 at once.
                                  [default: 5]
+    --force                      Force recalculation even if tags already exist.
 """
 
 import csv
@@ -25,6 +26,7 @@ import urllib.parse
 
 import boto3
 import docopt
+from botocore.exceptions import ClientError
 
 from concurrently import concurrently
 
@@ -38,10 +40,54 @@ def list_s3_objects(sess, *, bucket, prefix):
             yield {"bucket": bucket, "key": s3_obj["Key"]}
 
 
-def get_s3_object_checksums(sess, *, bucket, key, checksums):
-    hashes = {name: hashlib.new(name) for name in checksums}
+def check_existing_tags(s3, bucket, key, required_checksums):
+    """Check if object already has all required checksum tags."""
+    try:
+        response = s3.get_object_tagging(Bucket=bucket, Key=key)
+        existing_tags = {tag['Key']: tag['Value'] for tag in response.get('TagSet', [])}
+        
+        # Check if all required checksums exist as tags
+        for checksum in required_checksums:
+            if checksum not in existing_tags:
+                return False, existing_tags
+        
+        return True, existing_tags
+    except ClientError:
+        return False, {}
 
-    s3_obj = sess.client("s3").get_object(Bucket=bucket, Key=key)
+
+def get_s3_object_checksums(sess, *, bucket, key, checksums, force=False):
+    s3 = sess.client("s3")
+    
+    # Check if we should skip this object
+    if not force:
+        has_all_tags, existing_tags = check_existing_tags(s3, bucket, key, checksums)
+        if has_all_tags:
+            # Object already has all required tags, return them without recalculating
+            try:
+                s3_obj = s3.head_object(Bucket=bucket, Key=key)
+                result = {
+                    "bucket": bucket,
+                    "key": key,
+                    "size": s3_obj["ContentLength"],
+                    "ETag": s3_obj["ETag"],
+                    "VersionId": s3_obj.get("VersionId", ""),
+                    "last_modified": s3_obj["LastModified"].isoformat(),
+                    "skipped": True  # Mark that we skipped calculation
+                }
+                
+                # Add existing checksums from tags
+                for name in checksums:
+                    result[f"checksum.{name}"] = existing_tags.get(name, "")
+                
+                return result
+            except ClientError:
+                pass  # Fall through to calculate checksums
+    
+    # Calculate checksums
+    hashes = {name: hashlib.new(name) for name in checksums}
+    
+    s3_obj = s3.get_object(Bucket=bucket, Key=key)
 
     while chunk := s3_obj["Body"].read(8192):
         for hv in hashes.values():
@@ -54,10 +100,35 @@ def get_s3_object_checksums(sess, *, bucket, key, checksums):
         "ETag": s3_obj["ETag"],
         "VersionId": s3_obj.get("VersionId", ""),
         "last_modified": s3_obj["LastModified"].isoformat(),
+        "skipped": False
     }
 
+    # Calculate checksums and prepare tags
+    tags = {}
     for name, hv in hashes.items():
-        result[f"checksum.{name}"] = hv.hexdigest()
+        checksum_value = hv.hexdigest()
+        result[f"checksum.{name}"] = checksum_value
+        tags[name] = checksum_value
+
+    # Set tags on the S3 object
+    try:
+        tag_set = [{"Key": k, "Value": v} for k, v in tags.items()]
+        s3.put_object_tagging(
+            Bucket=bucket,
+            Key=key,
+            Tagging={"TagSet": tag_set}
+        )
+        if s3_obj.get("VersionId"):
+            # If versioning is enabled, tag the specific version
+            s3.put_object_tagging(
+                Bucket=bucket,
+                Key=key,
+                VersionId=s3_obj["VersionId"],
+                Tagging={"TagSet": tag_set}
+            )
+    except Exception as e:
+        # Log the error but don't fail the checksum calculation
+        print(f"Warning: Failed to set tags for {bucket}/{key}: {e}", file=sys.stderr)
 
     return result
 
@@ -67,6 +138,7 @@ def main():
 
     checksums = args["--checksums"].split(",")
     max_concurrency = int(args["--concurrency"])
+    force = args["--force"]
 
     for h in checksums:
         if h not in hashlib.algorithms_available:
@@ -86,17 +158,29 @@ def main():
         f"checksum.{name}" for name in checksums
     ]
 
+    total_objects = 0
+    total_skipped = 0
     with open(out_path, "w") as outfile:
         writer = csv.DictWriter(outfile, fieldnames=fieldnames)
         writer.writeheader()
 
         for _, output in concurrently(
-            lambda s3_obj: get_s3_object_checksums(sess, **s3_obj, checksums=checksums),
+            lambda s3_obj: get_s3_object_checksums(sess, **s3_obj, checksums=checksums, force=force),
             list_s3_objects(sess, bucket=bucket, prefix=prefix),
             max_concurrency=max_concurrency
         ):
+            # Don't write the 'skipped' field to CSV
+            skipped = output.pop('skipped', False)
             writer.writerow(output)
+            total_objects += 1
+            
+            if skipped:
+                total_skipped += 1
+            
+            if total_objects % 100 == 0:
+                print(f"Processed {total_objects} objects ({total_skipped} skipped)...", file=sys.stderr)
 
+    print(f"Total objects processed: {total_objects} ({total_skipped} skipped)", file=sys.stderr)
     print(out_path)
 
 
