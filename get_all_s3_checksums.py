@@ -289,16 +289,41 @@ def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, f
     bucket_skipped = 0
     bucket_bytes = 0
     
-    # Create progress bar for this bucket (we'll update total as we go)
-    pbar = tqdm(
-        total=None,  # Unknown total
-        desc=f"{bucket_name[:30]:30}",  # Truncate long names
-        unit="obj",
-        position=position,
-        leave=True,
-        bar_format="{desc} |{bar}| {n_fmt} [{elapsed}, {rate_fmt}] S:{postfix[skipped]}",
-        postfix={'skipped': 0}
-    )
+    # For remote systems, use simpler output
+    print(f"[Bucket {position+1}] Starting: {bucket_name}", file=sys.stderr)
+    
+    # Create progress bar for this bucket
+    # Disable multi-line progress bars on remote systems as they may not render properly
+    use_progress_bar = os.environ.get('DISABLE_PROGRESS', '').lower() != 'true'
+    
+    if use_progress_bar:
+        pbar = tqdm(
+            total=None,  # Unknown total
+            desc=f"{bucket_name[:30]:30}",  # Truncate long names
+            unit="obj",
+            position=position if parallel_buckets == 1 else None,  # Only use position for single bucket
+            leave=True,
+            ncols=100,  # Fixed width for remote terminals
+            file=sys.stderr,  # Explicitly use stderr
+            disable=position > 0 and parallel_buckets > 1,  # Disable extra bars in parallel mode
+            bar_format="{desc} |{bar}| {n_fmt} [{elapsed}, {rate_fmt}] S:{postfix[skipped]}",
+            postfix={'skipped': 0}
+        )
+    else:
+        # Dummy progress bar that just counts
+        class DummyProgressBar:
+            def __init__(self):
+                self.n = 0
+                self.skipped = 0
+            def update(self, n=1):
+                self.n += n
+            def set_postfix(self, postfix):
+                self.skipped = postfix.get('skipped', 0)
+            def set_description_str(self, desc):
+                pass
+            def close(self):
+                pass
+        pbar = DummyProgressBar()
     
     try:
         with open(temp_file, 'w') as f:
@@ -333,6 +358,10 @@ def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, f
                                             skipped=bucket_skipped if bucket_objects == 10 else 0, 
                                             bytes_processed=bucket_bytes)
                         bucket_bytes = 0  # Reset for next batch
+                    
+                    # Print status every 100 objects in parallel mode
+                    if bucket_objects % 100 == 0 and parallel_buckets > 1:
+                        print(f"[Bucket {position+1}] {bucket_name}: {bucket_objects} objects processed ({bucket_skipped} skipped)", file=sys.stderr)
             
             # Final update for remaining objects
             remaining_objects = bucket_objects % 10
@@ -344,10 +373,12 @@ def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, f
         # Mark as complete
         pbar.set_description_str(f"{bucket_name[:30]:30} ✓")
         pbar.close()
+        print(f"[Bucket {position+1}] Completed: {bucket_name} - {bucket_objects} objects ({bucket_skipped} skipped)", file=sys.stderr)
         
     except Exception as e:
         pbar.set_description_str(f"{bucket_name[:30]:30} ✗")
         pbar.close()
+        print(f"[Bucket {position+1}] Failed: {bucket_name} - Error: {str(e)[:100]}", file=sys.stderr)
         # Remove temp file on error
         if os.path.exists(temp_file):
             os.remove(temp_file)
