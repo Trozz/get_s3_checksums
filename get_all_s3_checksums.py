@@ -276,7 +276,7 @@ def count_bucket_objects(sess, bucket):
         return 0
 
 
-def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, force, fieldnames, tracker, temp_dir, position):
+def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, force, fieldnames, tracker, temp_dir, position, parallel_buckets=1):
     """Process a single bucket and write results to a temporary CSV file."""
     bucket_name, created_date = bucket_info
     
@@ -306,7 +306,7 @@ def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, f
             ncols=100,  # Fixed width for remote terminals
             file=sys.stderr,  # Explicitly use stderr
             disable=position > 0 and parallel_buckets > 1,  # Disable extra bars in parallel mode
-            bar_format="{desc} |{bar}| {n_fmt} [{elapsed}, {rate_fmt}] S:{postfix[skipped]}",
+            bar_format="{desc} |{bar}| {n_fmt} [{elapsed}, {rate_fmt}]",
             postfix={'skipped': 0}
         )
     else:
@@ -348,6 +348,8 @@ def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, f
                     if skipped:
                         bucket_skipped += 1
                         pbar.set_postfix({'skipped': bucket_skipped})
+                        # Update description with skipped count
+                        pbar.set_description(f"{bucket_name[:30]:30} (S:{bucket_skipped})")
                     
                     # Update progress bar
                     pbar.update(1)
@@ -468,7 +470,7 @@ def main():
                 position_counter['value'] += 1
             
             return process_bucket(bucket_info, sess, checksums, max_objects, 
-                                max_concurrency, force, fieldnames, tracker, temp_dir, position)
+                                max_concurrency, force, fieldnames, tracker, temp_dir, position, parallel_buckets)
         
         # Collect temporary files from parallel processing
         for _, temp_file in concurrently(
