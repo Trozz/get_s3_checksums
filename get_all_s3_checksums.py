@@ -7,34 +7,116 @@ across all S3 buckets in your AWS account. You can filter buckets by
 name pattern and limit object processing.
 
 Usage:
-    get_all_s3_checksums.py [--checksums=<CHECKSUMS>] [--concurrency=<CONCURRENCY>] [--bucket-filter=<FILTER>] [--max-objects=<MAX>] [--skip-empty] [--force]
+    get_all_s3_checksums.py [--checksums=<CHECKSUMS>] [--concurrency=<CONCURRENCY>] [--bucket-filter=<FILTER>] [--max-objects=<MAX>] [--skip-empty] [--force] [--parallel-buckets=<PARALLEL>]
     get_all_s3_checksums.py (-h | --help)
 
 Options:
     -h --help                    Show this screen.
     --checksums=<CHECKSUMS>      Comma-separated list of checksums to fetch.
                                  [default: md5,sha1,sha256,sha512]
-    --concurrency=<CONCURRENCY>  Max number of objects to fetch from S3 at once.
+    --concurrency=<CONCURRENCY>  Max number of objects to fetch from S3 at once per bucket.
                                  [default: 5]
     --bucket-filter=<FILTER>     Only process buckets matching this pattern (supports wildcards).
     --max-objects=<MAX>          Maximum number of objects to process per bucket.
     --skip-empty                 Skip buckets with no objects.
     --force                      Force recalculation even if tags already exist.
+    --parallel-buckets=<PARALLEL> Number of buckets to process in parallel.
+                                 [default: 1]
 """
 
 import csv
 import hashlib
 import secrets
 import sys
+import os
+import tempfile
+import shutil
 import urllib.parse
 import fnmatch
+import time
+import threading
 from datetime import datetime
+from collections import defaultdict
 
 import boto3
 import docopt
 from botocore.exceptions import ClientError
+from tqdm import tqdm
 
 from concurrently import concurrently
+
+
+class PerformanceTracker:
+    """Track performance metrics across all bucket processing."""
+    def __init__(self, total_buckets):
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        self.total_buckets = total_buckets
+        self.completed_buckets = 0
+        self.bucket_metrics = defaultdict(lambda: {
+            'objects': 0, 'skipped': 0, 'bytes': 0, 'start_time': None, 'end_time': None
+        })
+        self.total_objects = 0
+        self.total_skipped = 0
+        self.total_bytes = 0
+    
+    def start_bucket(self, bucket_name):
+        with self.lock:
+            self.bucket_metrics[bucket_name]['start_time'] = time.time()
+    
+    def update_bucket(self, bucket_name, objects=0, skipped=0, bytes_processed=0):
+        with self.lock:
+            self.bucket_metrics[bucket_name]['objects'] += objects
+            self.bucket_metrics[bucket_name]['skipped'] += skipped
+            self.bucket_metrics[bucket_name]['bytes'] += bytes_processed
+            self.total_objects += objects
+            self.total_skipped += skipped
+            self.total_bytes += bytes_processed
+    
+    def complete_bucket(self, bucket_name):
+        with self.lock:
+            self.bucket_metrics[bucket_name]['end_time'] = time.time()
+            self.completed_buckets += 1
+    
+    def get_stats(self):
+        with self.lock:
+            elapsed = time.time() - self.start_time
+            objects_per_sec = self.total_objects / elapsed if elapsed > 0 else 0
+            mb_per_sec = (self.total_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            
+            # Estimate remaining time
+            if self.completed_buckets > 0:
+                avg_time_per_bucket = elapsed / self.completed_buckets
+                remaining_buckets = self.total_buckets - self.completed_buckets
+                estimated_remaining = avg_time_per_bucket * remaining_buckets
+            else:
+                estimated_remaining = 0
+            
+            return {
+                'elapsed': elapsed,
+                'objects_per_sec': objects_per_sec,
+                'mb_per_sec': mb_per_sec,
+                'total_objects': self.total_objects,
+                'total_skipped': self.total_skipped,
+                'total_mb': self.total_bytes / (1024 * 1024),
+                'completed_buckets': self.completed_buckets,
+                'total_buckets': self.total_buckets,
+                'estimated_remaining': estimated_remaining
+            }
+    
+    def print_progress(self):
+        """Print current progress statistics."""
+        stats = self.get_stats()
+        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(stats['elapsed']))
+        remaining_str = time.strftime('%H:%M:%S', time.gmtime(stats['estimated_remaining']))
+        
+        print(f"\n=== Performance Metrics ===", file=sys.stderr)
+        print(f"Elapsed: {elapsed_str} | Remaining: ~{remaining_str}", file=sys.stderr)
+        print(f"Buckets: {stats['completed_buckets']}/{stats['total_buckets']} completed", file=sys.stderr)
+        print(f"Objects: {stats['total_objects']} processed ({stats['total_skipped']} skipped)", file=sys.stderr)
+        print(f"Speed: {stats['objects_per_sec']:.1f} objects/s | {stats['mb_per_sec']:.1f} MB/s", file=sys.stderr)
+        print(f"Data: {stats['total_mb']:.1f} MB processed", file=sys.stderr)
+        print("=" * 26, file=sys.stderr)
 
 
 def list_all_buckets(sess):
@@ -194,6 +276,87 @@ def count_bucket_objects(sess, bucket):
         return 0
 
 
+def process_bucket(bucket_info, sess, checksums, max_objects, max_concurrency, force, fieldnames, tracker, temp_dir, position):
+    """Process a single bucket and write results to a temporary CSV file."""
+    bucket_name, created_date = bucket_info
+    
+    tracker.start_bucket(bucket_name)
+    
+    # Create a temporary CSV file for this bucket
+    temp_file = os.path.join(temp_dir, f"bucket_{bucket_name.replace('/', '_')}.csv")
+    
+    bucket_objects = 0
+    bucket_skipped = 0
+    bucket_bytes = 0
+    
+    # Create progress bar for this bucket (we'll update total as we go)
+    pbar = tqdm(
+        total=None,  # Unknown total
+        desc=f"{bucket_name[:30]:30}",  # Truncate long names
+        unit="obj",
+        position=position,
+        leave=True,
+        bar_format="{desc} |{bar}| {n_fmt} [{elapsed}, {rate_fmt}] S:{postfix[skipped]}",
+        postfix={'skipped': 0}
+    )
+    
+    try:
+        with open(temp_file, 'w') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            # Don't write header in temp files, we'll add it to the final file
+            
+            for _, output in concurrently(
+                lambda s3_obj: get_s3_object_checksums(sess, **s3_obj, checksums=checksums, force=force),
+                list_s3_objects(sess, bucket=bucket_name, max_objects=max_objects),
+                max_concurrency=max_concurrency
+            ):
+                if output:  # Skip None results from errors
+                    # Don't write the 'skipped' field to CSV
+                    skipped = output.pop('skipped', False)
+                    size = output.get('size', 0)
+                    
+                    writer.writerow(output)
+                    
+                    bucket_objects += 1
+                    bucket_bytes += size
+                    
+                    if skipped:
+                        bucket_skipped += 1
+                        pbar.set_postfix({'skipped': bucket_skipped})
+                    
+                    # Update progress bar
+                    pbar.update(1)
+                    
+                    # Update tracker for overall stats
+                    if bucket_objects % 10 == 0:
+                        tracker.update_bucket(bucket_name, objects=10, 
+                                            skipped=bucket_skipped if bucket_objects == 10 else 0, 
+                                            bytes_processed=bucket_bytes)
+                        bucket_bytes = 0  # Reset for next batch
+            
+            # Final update for remaining objects
+            remaining_objects = bucket_objects % 10
+            if remaining_objects > 0 or bucket_objects == 0:
+                tracker.update_bucket(bucket_name, objects=remaining_objects, 
+                                    skipped=bucket_skipped if bucket_objects < 10 else 0, 
+                                    bytes_processed=bucket_bytes)
+        
+        # Mark as complete
+        pbar.set_description_str(f"{bucket_name[:30]:30} ✓")
+        pbar.close()
+        
+    except Exception as e:
+        pbar.set_description_str(f"{bucket_name[:30]:30} ✗")
+        pbar.close()
+        # Remove temp file on error
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        temp_file = None
+    
+    tracker.complete_bucket(bucket_name)
+    return temp_file
+
+
 def main():
     args = docopt.docopt(__doc__)
 
@@ -203,6 +366,7 @@ def main():
     max_objects = int(args["--max-objects"]) if args["--max-objects"] else None
     skip_empty = args["--skip-empty"]
     force = args["--force"]
+    parallel_buckets = int(args["--parallel-buckets"])
 
     for h in checksums:
         if h not in hashlib.algorithms_available:
@@ -250,44 +414,78 @@ def main():
         f"checksum.{name}" for name in checksums
     ]
 
-    total_objects = 0
-    total_skipped = 0
-    with open(out_path, "w") as outfile:
-        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-        writer.writeheader()
-
-        for bucket_name, created_date in filtered_buckets:
-            print(f"\nProcessing bucket: {bucket_name} (created: {created_date.strftime('%Y-%m-%d')})", file=sys.stderr)
+    # Initialize performance tracker
+    tracker = PerformanceTracker(len(filtered_buckets))
+    
+    # Create temporary directory for intermediate files
+    temp_dir = tempfile.mkdtemp(prefix="s3_checksums_")
+    temp_files = []
+    
+    try:
+        # Print initial status
+        print(f"\n🚀 Starting parallel processing with {parallel_buckets} concurrent bucket(s)", file=sys.stderr)
+        print(f"📁 Processing {len(filtered_buckets)} buckets total\n", file=sys.stderr)
+        
+        # Create a counter for bucket positions
+        position_counter = {'value': 0}
+        position_lock = threading.Lock()
+        
+        # Process buckets in parallel
+        def process_bucket_wrapper(bucket_info):
+            with position_lock:
+                position = position_counter['value']
+                position_counter['value'] += 1
             
-            bucket_objects = 0
-            bucket_skipped = 0
-            try:
-                for _, output in concurrently(
-                    lambda s3_obj: get_s3_object_checksums(sess, **s3_obj, checksums=checksums, force=force),
-                    list_s3_objects(sess, bucket=bucket_name, max_objects=max_objects),
-                    max_concurrency=max_concurrency
-                ):
-                    if output:  # Skip None results from errors
-                        # Don't write the 'skipped' field to CSV
-                        skipped = output.pop('skipped', False)
-                        writer.writerow(output)
-                        bucket_objects += 1
-                        total_objects += 1
-                        
-                        if skipped:
-                            bucket_skipped += 1
-                            total_skipped += 1
-                        
-                        if bucket_objects % 100 == 0:
-                            print(f"  Processed {bucket_objects} objects ({bucket_skipped} skipped)...", file=sys.stderr)
-                
-                print(f"  Completed: {bucket_objects} objects ({bucket_skipped} skipped)", file=sys.stderr)
-                
-            except Exception as e:
-                print(f"  Error processing bucket {bucket_name}: {e}", file=sys.stderr)
-
-    print(f"\nTotal objects processed: {total_objects} ({total_skipped} skipped)", file=sys.stderr)
-    print(out_path)
+            return process_bucket(bucket_info, sess, checksums, max_objects, 
+                                max_concurrency, force, fieldnames, tracker, temp_dir, position)
+        
+        # Collect temporary files from parallel processing
+        for _, temp_file in concurrently(
+            process_bucket_wrapper,
+            filtered_buckets,
+            max_concurrency=parallel_buckets
+        ):
+            if temp_file:
+                temp_files.append(temp_file)
+        
+        # Add some spacing after progress bars
+        print("\n" * (len(filtered_buckets) + 1), file=sys.stderr)
+        
+        # Combine all temporary CSV files into the final output
+        print(f"📋 Combining {len(temp_files)} temporary files...", file=sys.stderr)
+        
+        with open(out_path, "w") as outfile:
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+            
+            # Read and combine all temp files
+            for temp_file in temp_files:
+                try:
+                    with open(temp_file, 'r') as f:
+                        reader = csv.DictReader(f, fieldnames=fieldnames)
+                        for row in reader:
+                            writer.writerow(row)
+                except Exception as e:
+                    print(f"Error reading temp file {temp_file}: {e}", file=sys.stderr)
+        
+        # Final statistics
+        stats = tracker.get_stats()
+        elapsed_str = time.strftime('%H:%M:%S', time.gmtime(stats['elapsed']))
+        
+        print(f"\n✅ Processing complete!", file=sys.stderr)
+        print(f"⏱️  Total time: {elapsed_str}", file=sys.stderr)
+        print(f"📊 Objects: {stats['total_objects']:,} processed ({stats['total_skipped']:,} skipped)", file=sys.stderr)
+        print(f"📈 Speed: {stats['objects_per_sec']:.1f} objects/s | {stats['mb_per_sec']:.1f} MB/s", file=sys.stderr)
+        print(f"💾 Data: {stats['total_mb']:.1f} MB processed", file=sys.stderr)
+        print(f"\n📄 Output saved to: {out_path}", file=sys.stderr)
+        print(out_path)
+        
+    finally:
+        # Clean up temporary directory
+        try:
+            shutil.rmtree(temp_dir)
+        except Exception as e:
+            print(f"Warning: Could not remove temp directory {temp_dir}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":
